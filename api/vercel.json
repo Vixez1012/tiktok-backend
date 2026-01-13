@@ -1,8 +1,104 @@
-{
-  "functions": {
-    "api/upload.js": {
-      "memory": 1024,
-      "maxDuration": 60
+import multer from "multer";
+import fetch from "node-fetch";
+
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Helper: upload a chunk to TikTok
+async function uploadChunk(url, chunk) {
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/octet-stream"
+    },
+    body: chunk
+  });
+  if (!res.ok) throw new Error(`Chunk upload failed with status ${res.status}`);
+}
+
+export default async function handler(req, res) {
+  // Only POST allowed
+  if (req.method !== "POST") return res.status(405).json({ success: false, error: "Method not allowed" });
+
+  // Parse video using multer
+  upload.single("video")(req, res, async (err) => {
+    if (err || !req.file) return res.status(400).json({ success: false, error: "No video uploaded" });
+
+    const videoBuffer = req.file.buffer;
+    const videoSize = videoBuffer.length;
+    const chunkSize = 10 * 1024 * 1024; // 10 MB
+    const totalChunks = Math.ceil(videoSize / chunkSize);
+
+    const caption = req.body.caption || "";
+    const userAccessToken = req.body.user_access_token; // MUST come from frontend via OAuth
+
+    if (!userAccessToken) return res.status(400).json({ success: false, error: "Missing TikTok access token" });
+
+    try {
+      // 1️⃣ Initialize TikTok upload
+      const initResp = await fetch("https://open.tiktokapis.com/v2/post/publish/video/init/", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${userAccessToken}`,
+          "Content-Type": "application/json; charset=UTF-8"
+        },
+        body: JSON.stringify({
+          post_info: {
+            title: caption,
+            privacy_level: "PUBLIC_TO_EVERYONE",
+            disable_duet: false,
+            disable_comment: false,
+            disable_stitch: false,
+            video_cover_timestamp_ms: 1000
+          },
+          source_info: {
+            source: "FILE_UPLOAD",
+            video_size: videoSize,
+            chunk_size: chunkSize,
+            total_chunk_count: totalChunks
+          }
+        })
+      });
+
+      if (!initResp.ok) {
+        const text = await initResp.text();
+        throw new Error(`TikTok init failed: ${text}`);
+      }
+
+      const initData = await initResp.json();
+
+      // 2️⃣ Upload chunks sequentially
+      const uploadUrls = initData.data.upload_url_list; // TikTok returns array of URLs
+      for (let i = 0; i < uploadUrls.length; i++) {
+        const start = i * chunkSize;
+        const end = Math.min(start + chunkSize, videoSize);
+        const chunk = videoBuffer.slice(start, end);
+        await uploadChunk(uploadUrls[i], chunk);
+      }
+
+      // 3️⃣ Notify TikTok to finalize
+      const finalizeResp = await fetch("https://open.tiktokapis.com/v2/post/publish/video/finish/", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${userAccessToken}`,
+          "Content-Type": "application/json; charset=UTF-8"
+        },
+        body: JSON.stringify({
+          video_id: initData.data.video_id
+        })
+      });
+
+      if (!finalizeResp.ok) {
+        const text = await finalizeResp.text();
+        throw new Error(`TikTok finalize failed: ${text}`);
+      }
+
+      const finalizeData = await finalizeResp.json();
+
+      res.status(200).json({ success: true, result: finalizeData });
+
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ success: false, error: error.message });
     }
-  }
+  });
 }
